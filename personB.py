@@ -1,4 +1,5 @@
 import socket
+import threading
 import rsa
 
 publicB, privateB = rsa.newkeys(512)
@@ -11,15 +12,62 @@ publicA = rsa.PublicKey.load_pkcs1(A_key_data)
 
 socketB.sendall(publicB.save_pkcs1())
 print('sent public key to person A')
+print('ready to chat (type "exit" to quit)')
 
-data = socketB.recv(1024)
-print('received encrypted msg:', data)
-plaintext = rsa.decrypt(data, privateB)
-print('received decrypted msg:', plaintext.decode())
+running = True
+cipher_len = (publicB.n.bit_length() + 7) // 8
 
-response = input("enter a msg to send to person A: ")
-ciphertext = rsa.encrypt(response.encode(), publicA)
-socketB.sendall(ciphertext)
-print("sent encrypted msg:" , ciphertext)
+
+def recv_exact(n):
+    buf = b''
+    while len(buf) < n:
+        chunk = socketB.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def receive_loop():
+    global running
+    while running:
+        try:
+            data = recv_exact(cipher_len)
+        except OSError:
+            break
+        if not data:
+            break
+        plaintext = rsa.decrypt(data, privateB)
+        print('\nA:', plaintext.decode())
+        if plaintext.decode() == 'exit':
+            running = False
+            break
+
+
+def send_loop():
+    global running
+    while running:
+        try:
+            message = input('B: ')
+        except EOFError:
+            message = 'exit'
+        ciphertext = rsa.encrypt(message.encode(), publicA)
+        try:
+            socketB.sendall(ciphertext)
+        except OSError:
+            break
+        if message == 'exit':
+            running = False
+            break
+
+
+receiver = threading.Thread(target=receive_loop, daemon=True)
+sender = threading.Thread(target=send_loop, daemon=True)
+
+receiver.start()
+sender.start()
+
+sender.join()
+receiver.join(timeout=1)
 
 socketB.close()

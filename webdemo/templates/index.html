@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Full-Duplex RSA Chat Demo</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #2a2f3d;
+    --text: #e6e8ee;
+    --muted: #8b90a0;
+    --accent: #5b8cff;
+    --self-bubble: #2d4ea3;
+    --peer-bubble: #232838;
+    --ok: #3ecf8e;
+    --err: #ff6b6b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  #status {
+    font-size: 13px;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  #status .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--err);
+  }
+  #status.ready .dot { background: var(--ok); }
+  main {
+    flex: 1;
+    display: flex;
+    overflow: hidden;
+  }
+  #chat {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    max-width: 720px;
+    margin: 0 auto;
+    width: 100%;
+  }
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .msg {
+    max-width: 70%;
+    padding: 10px 14px;
+    border-radius: 14px;
+    line-height: 1.4;
+    font-size: 14px;
+    word-wrap: break-word;
+  }
+  .msg.self { align-self: flex-end; background: var(--self-bubble); border-bottom-right-radius: 4px; }
+  .msg.peer { align-self: flex-start; background: var(--peer-bubble); border-bottom-left-radius: 4px; }
+  .msg.sys { align-self: center; background: none; color: var(--muted); font-size: 12px; }
+  .cipher {
+    display: block;
+    font-family: monospace;
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+    word-break: break-all;
+    opacity: 0.7;
+  }
+  #composer {
+    display: flex;
+    gap: 10px;
+    padding: 16px 20px;
+    border-top: 1px solid var(--border);
+  }
+  #input {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-size: 14px;
+    outline: none;
+  }
+  #input:focus { border-color: var(--accent); }
+  #send {
+    background: var(--accent);
+    border: none;
+    color: white;
+    padding: 0 20px;
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+  }
+  #send:disabled { opacity: 0.4; cursor: not-allowed; }
+  aside {
+    width: 260px;
+    border-left: 1px solid var(--border);
+    padding: 20px;
+    font-size: 12px;
+    color: var(--muted);
+    overflow-y: auto;
+  }
+  aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text); margin-top: 0; }
+  aside code { color: var(--accent); }
+  aside ol { padding-left: 18px; }
+  aside li { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Full-Duplex RSA Chat Demo</h1>
+  <div id="status"><span class="dot"></span><span id="status-text">connecting...</span></div>
+</header>
+<main>
+  <div id="chat">
+    <div id="log"></div>
+    <div id="composer">
+      <input id="input" type="text" placeholder="Type a message..." disabled autocomplete="off">
+      <button id="send" disabled>Send</button>
+    </div>
+  </div>
+  <aside>
+    <h2>How this works</h2>
+    <ol>
+      <li>Each browser tab generates its own RSA-OAEP 2048-bit keypair locally via the Web Crypto API. Private keys never leave the browser.</li>
+      <li>Public keys are exchanged through the server, which only relays them.</li>
+      <li>Every message is encrypted with the <em>recipient's</em> public key before it leaves the browser, and decrypted with the <em>recipient's</em> private key on arrival.</li>
+      <li>Because encryption and decryption run independently and simultaneously on both sides over a persistent WebSocket, either party can send at any time &mdash; this is full duplex, not turn-based.</li>
+      <li>The server (<code>server.py</code>) only ever sees ciphertext.</li>
+    </ol>
+    <h2>Run it</h2>
+    <p>Open this page in two separate tabs or devices to play both roles (A and B).</p>
+  </aside>
+</main>
+<script>
+const socket = io();
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('status-text');
+const log = document.getElementById('log');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+
+let myRole = null;
+let myKeyPair = null;
+let peerPublicKey = null;
+let peerConnected = false;
+
+function addMessage(text, cls, cipherB64) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + cls;
+  div.textContent = text;
+  if (cipherB64) {
+    const c = document.createElement('span');
+    c.className = 'cipher';
+    c.textContent = 'ciphertext: ' + cipherB64.slice(0, 60) + '...';
+    div.appendChild(c);
+  }
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function setReady(ready, text) {
+  statusEl.classList.toggle('ready', ready);
+  statusText.textContent = text;
+  input.disabled = !ready;
+  sendBtn.disabled = !ready;
+}
+
+function bufToB64(buf) {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)));
+}
+function b64ToBuf(b64) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr.buffer;
+}
+
+async function generateKeys() {
+  myKeyPair = await crypto.subtle.generateKey(
+    { name: 'RSA-OAEP', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
+    true,
+    ['encrypt', 'decrypt']
+  );
+  const jwk = await crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
+  socket.emit('public_key', { jwk });
+}
+
+async function importPeerKey(jwk) {
+  peerPublicKey = await crypto.subtle.importKey(
+    'jwk', jwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, true, ['encrypt']
+  );
+  maybeReady();
+}
+
+function maybeReady() {
+  if (peerPublicKey && peerConnected) {
+    setReady(true, 'Encrypted channel ready (you are ' + myRole + ')');
+  }
+}
+
+socket.on('connect', () => {
+  setReady(false, 'connected, generating keys...');
+  generateKeys();
+});
+
+socket.on('assigned_role', (data) => {
+  myRole = data.role;
+  addMessage('You are Person ' + myRole, 'sys');
+});
+
+socket.on('room_full', () => {
+  setReady(false, 'room full - only two peers supported at a time');
+});
+
+socket.on('peer_joined', () => {
+  peerConnected = true;
+  addMessage('Peer joined', 'sys');
+  maybeReady();
+});
+
+socket.on('peer_left', () => {
+  peerConnected = false;
+  peerPublicKey = null;
+  setReady(false, 'peer disconnected');
+  addMessage('Peer left', 'sys');
+});
+
+socket.on('public_key', (data) => {
+  importPeerKey(data.jwk);
+});
+
+socket.on('cipher_message', async (data) => {
+  const buf = b64ToBuf(data.cipher);
+  const plainBuf = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, myKeyPair.privateKey, buf);
+  const text = new TextDecoder().decode(plainBuf);
+  addMessage(text, 'peer', data.cipher);
+});
+
+async function sendMessage() {
+  const text = input.value.trim();
+  if (!text || !peerPublicKey) return;
+  const plainBuf = new TextEncoder().encode(text);
+  const cipherBuf = await crypto.subtle.encrypt({ name: 'RSA-OAEP' }, peerPublicKey, plainBuf);
+  const cipherB64 = bufToB64(cipherBuf);
+  socket.emit('cipher_message', { cipher: cipherB64 });
+  addMessage(text, 'self', cipherB64);
+  input.value = '';
+}
+
+sendBtn.addEventListener('click', sendMessage);
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendMessage();
+});
+</script>
+</body>
+</html>
